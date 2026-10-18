@@ -24,6 +24,7 @@ from vulnerabilities.importers.osv import get_fixed_versions
 from vulnerabilities.importers.osv import get_published_date
 from vulnerabilities.importers.osv import get_references
 from vulnerabilities.importers.osv import get_severities
+from vulnerabilities.importers.osv import parse_advisory_data
 from vulnerabilities.severity_systems import SCORING_SYSTEMS
 
 
@@ -397,3 +398,92 @@ class TestOSVImporter(TestCase):
         )
 
         assert results == [SemverVersion("6.5.4")]
+
+    def parse_lodash_affected_packages(self, affected_entry):
+        raw_data = {
+            "id": "GHSA-xxxx-yyyy-zzzz",
+            "summary": "test advisory",
+            "affected": [
+                {"package": {"name": "lodash", "ecosystem": "npm"}, **affected_entry}
+            ],
+        }
+        advisory = parse_advisory_data(
+            raw_data=raw_data,
+            supported_ecosystems=["npm"],
+            advisory_url="https://example.org/advisory",
+        )
+        return advisory.affected_packages
+
+    def test_parse_advisory_data_with_fixed_version(self):
+        results = self.parse_lodash_affected_packages(
+            {
+                "ranges": [
+                    {
+                        "type": "SEMVER",
+                        "events": [{"introduced": "0"}, {"fixed": "1.2.3"}],
+                    }
+                ]
+            }
+        )
+
+        assert len(results) == 1
+        assert results[0].package == PackageURL(type="npm", name="lodash")
+        assert results[0].affected_version_range is None
+        assert results[0].fixed_version == SemverVersion("1.2.3")
+
+    def test_parse_advisory_data_with_introduced_only_range(self):
+        results = self.parse_lodash_affected_packages(
+            {
+                "ranges": [
+                    {"type": "SEMVER", "events": [{"introduced": "1.0.0"}]}
+                ]
+            }
+        )
+
+        assert len(results) == 1
+        assert results[0].package == PackageURL(type="npm", name="lodash")
+        assert str(results[0].affected_version_range) == "vers:npm/>=1.0.0"
+        assert results[0].fixed_version is None
+
+    def test_parse_advisory_data_with_versions_list_only(self):
+        results = self.parse_lodash_affected_packages({"versions": ["1.0.0", "1.1.0"]})
+
+        assert len(results) == 1
+        assert results[0].package == PackageURL(type="npm", name="lodash")
+        assert str(results[0].affected_version_range) == "vers:npm/1.0.0|1.1.0"
+        assert results[0].fixed_version is None
+
+    def test_parse_advisory_data_with_versions_list_and_fixed_version(self):
+        results = self.parse_lodash_affected_packages(
+            {
+                "versions": ["1.0.0", "1.1.0"],
+                "ranges": [
+                    {
+                        "type": "SEMVER",
+                        "events": [{"introduced": "0"}, {"fixed": "1.2.3"}],
+                    }
+                ],
+            }
+        )
+
+        assert len(results) == 1
+        assert results[0].package == PackageURL(type="npm", name="lodash")
+        assert str(results[0].affected_version_range) == "vers:npm/1.0.0|1.1.0"
+        assert results[0].fixed_version == SemverVersion("1.2.3")
+
+    def test_parse_advisory_data_with_last_affected_range(self):
+        results = self.parse_lodash_affected_packages(
+            {
+                "ranges": [
+                    {
+                        "type": "SEMVER",
+                        "events": [{"introduced": "1.0.0"}, {"last_affected": "1.5.0"}],
+                    }
+                ]
+            }
+        )
+
+        assert len(results) == 1
+        assert results[0].package == PackageURL(type="npm", name="lodash")
+        assert str(results[0].affected_version_range) == "vers:npm/>=1.0.0|<=1.5.0"
+        assert results[0].fixed_version is None

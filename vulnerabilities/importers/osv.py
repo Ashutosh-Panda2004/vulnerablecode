@@ -17,6 +17,7 @@ import dateparser
 from cvss.exceptions import CVSS3MalformedError
 from cvss.exceptions import CVSS4MalformedError
 from packageurl import PackageURL
+from univers.version_constraint import VersionConstraint
 from univers.version_range import RANGE_CLASS_BY_SCHEMES
 from univers.versions import InvalidVersion
 from univers.versions import SemverVersion
@@ -83,10 +84,16 @@ def parse_advisory_data(
             supported_ecosystem=purl.type,
         )
 
+        has_fixed_versions = False
+        unfixed_affected_packages = []
+
         for fixed_range in affected_pkg.get("ranges") or []:
             fixed_version = get_fixed_versions(
                 fixed_range=fixed_range, raw_id=raw_id, supported_ecosystem=purl.type
             )
+
+            if fixed_version:
+                has_fixed_versions = True
 
             for version in fixed_version:
                 affected_packages.append(
@@ -96,6 +103,34 @@ def parse_advisory_data(
                         fixed_version=version,
                     )
                 )
+
+            if not fixed_version:
+                event_version_range = get_affected_version_range_from_events(
+                    fixed_range=fixed_range,
+                    raw_id=raw_id,
+                    supported_ecosystem=purl.type,
+                )
+                if event_version_range:
+                    unfixed_affected_packages.append(
+                        AffectedPackage(
+                            package=purl,
+                            affected_version_range=event_version_range,
+                        )
+                    )
+
+        if affected_version_range and not has_fixed_versions:
+            # The affected entry has an explicit list of versions but no
+            # fixed version. Keep the entry instead of dropping it.
+            affected_packages.append(
+                AffectedPackage(
+                    package=purl,
+                    affected_version_range=affected_version_range,
+                )
+            )
+        elif not affected_version_range:
+            # The affected entry has ranges without any fixed version, such
+            # as unfixed vulnerabilities. Keep one package per such range.
+            affected_packages.extend(unfixed_affected_packages)
     database_specific = raw_data.get("database_specific") or {}
     cwe_ids = database_specific.get("cwe_ids") or []
     weaknesses = list(map(get_cwe_id, cwe_ids))
@@ -270,6 +305,73 @@ def get_affected_version_range(affected_pkg, raw_id, supported_ecosystem):
                 f"Invalid VersionRange  for affected_pkg: {affected_pkg} "
                 f"for OSV id: {raw_id!r}: error:{e!r}"
             )
+
+
+def get_affected_version_range_from_events(fixed_range, raw_id, supported_ecosystem):
+    """
+    Return a univers VersionRange built from the events of an OSV range or
+    None. Use a ``raw_id`` OSV id and ``supported_ecosystem``.
+
+    Only the ``introduced``, ``last_affected``, ``fixed`` and ``limit`` events
+    take part in the affected range. This is used for ranges that have no
+    fixed version, such as unfixed vulnerabilities, which would otherwise
+    be dropped entirely.
+    """
+    if "type" not in fixed_range:
+        logger.error(f"Invalid fixed_range type for: {fixed_range} for OSV id: {raw_id!r}")
+        return None
+
+    fixed_range_type = fixed_range["type"]
+    if fixed_range_type not in ("ECOSYSTEM", "SEMVER"):
+        logger.error(
+            f"Unsupported range type: {fixed_range_type!r} for OSV id: {raw_id!r}"
+        )
+        return None
+
+    version_range_class = RANGE_CLASS_BY_SCHEMES.get(supported_ecosystem)
+    if not version_range_class:
+        logger.error(
+            f"Unsupported ecosystem: {supported_ecosystem!r} for OSV id: {raw_id!r}"
+        )
+        return None
+
+    if fixed_range_type == "SEMVER":
+        version_class = SemverVersion
+    else:
+        version_class = version_range_class.version_class
+
+    comparators_by_event = {
+        "introduced": ">=",
+        "last_affected": "<=",
+        "fixed": "<",
+        "limit": "<",
+    }
+    constraints = []
+    for event in fixed_range.get("events") or []:
+        for event_type, comparator in comparators_by_event.items():
+            version = event.get(event_type)
+            if not version:
+                continue
+            try:
+                version_obj = version_class(version)
+            except InvalidVersion:
+                logger.error(
+                    f"Invalid version: {version!r} for OSV id: {raw_id!r}"
+                )
+                continue
+            constraints.append(VersionConstraint(comparator=comparator, version=version_obj))
+
+    if not constraints:
+        return None
+
+    try:
+        return version_range_class(constraints=constraints)
+    except Exception as e:
+        logger.error(
+            f"Failed to create VersionRange from: {fixed_range}: "
+            f"for OSV id: {raw_id!r}: error:{e!r}"
+        )
+        return None
 
 
 def get_fixed_version_range(versions, ecosystem):
